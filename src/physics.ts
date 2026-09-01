@@ -10,6 +10,7 @@ export type SimParams = {
   contactPhase: number
   racketSpeed: number
   racketAcceleration: number
+  afterContactDeceleration: number
   racketPath: RacketPath
   racketPathRadius: number
   circleSideTilt: number
@@ -22,11 +23,14 @@ export type SimParams = {
   facePathAngle: number
   faceTilt: number
   rubberGrip: number
-  restitution: number
+  topsheetDamping: number
+  topsheetTension: number
+  boosterLevel: number
   spongeThickness: number
   spongeHardness: number
   spongeDamping: number
   bladeStiffness: number
+  racketMass: number
   bladeDamping: number
   tableFriction: number
   spinX: number
@@ -62,8 +66,15 @@ export type SimResult = {
     peakNormalForce: number
     contactTime: number
     effectiveRestitution: number
+    effectiveTopsheetTension: number
+    effectiveSpongeThickness: number
+    effectiveSpongeHardness: number
     spongeCompression: number
+    spongeUsableTravel: number
     spongeCompressionRatio: number
+    bladeNaturalFrequency: number
+    bladeDeflection: number
+    bladeDissipatedEnergy: number
     bottomedOut: boolean
     outgoingSpeed: number
     elevation: number
@@ -76,11 +87,15 @@ export type SimResult = {
 
 export const BALL_MASS = 0.0027
 export const BALL_RADIUS = 0.02
+export const SPONGE_BOTTOM_OUT_STRAIN = 0.65
 const BALL_AREA = Math.PI * BALL_RADIUS * BALL_RADIUS
 const BALL_INERTIA = (2 / 3) * BALL_MASS * BALL_RADIUS * BALL_RADIUS
 const AIR_DENSITY = 1.225
 const DRAG_COEFFICIENT = 0.47
 const G = 9.81
+// Midpoint of the ITTF-approved table rebound band (230-260 mm from a 300 mm
+// drop): e = sqrt(rebound height / drop height) is approximately 0.90.
+const TABLE_RESTITUTION = 0.9
 const TABLE_REST_SPEED = 0.35
 export const TABLE_SURFACE_Y = 0.76
 export const TABLE_LENGTH = 2.74
@@ -97,6 +112,29 @@ export const DEFAULT_BALL_START: BallStart = {
 }
 export const SIM_START_TIME = 0
 
+export const MATERIAL_LIMITS = {
+  rubberGrip: { min: 0.05, max: 1.3, step: 0.01 },
+  topsheetDamping: { min: 0.05, max: 0.35, step: 0.01 },
+  topsheetTension: { min: 0, max: 6, step: 0.1 },
+  boosterLevel: { min: 0, max: 100, step: 1 },
+  spongeThickness: { min: 1, max: 2.3, step: 0.1 },
+  spongeHardness: { min: 25, max: 60, step: 1 },
+  spongeDamping: { min: 0.1, max: 0.45, step: 0.01 },
+  bladeStiffness: { min: 1, max: 6, step: 0.1 },
+  racketMass: { min: 130, max: 210, step: 1 },
+  bladeDamping: { min: 0.005, max: 0.1, step: 0.005 },
+} as const
+
+export const BOOSTER_EFFECTS = {
+  thicknessExpansion: 0.08,
+  hardnessReduction: 0.18,
+  tensionIncrease: 1.1,
+  lossReduction: 0.25,
+} as const
+
+const MAX_EFFECTIVE_TOPSHEET_TENSION = MATERIAL_LIMITS.topsheetTension.max
+  + BOOSTER_EFFECTS.tensionIncrease
+
 export const DEFAULT_PARAMS: SimParams = {
   ballSpeed: 10 / 3.6,
   ballAzimuth: 0,
@@ -104,6 +142,7 @@ export const DEFAULT_PARAMS: SimParams = {
   contactPhase: 55,
   racketSpeed: 80 / 3.6,
   racketAcceleration: 0,
+  afterContactDeceleration: 0,
   racketPath: 'linear',
   racketPathRadius: 0.7,
   circleSideTilt: 0,
@@ -116,12 +155,15 @@ export const DEFAULT_PARAMS: SimParams = {
   facePathAngle: 0,
   faceTilt: -80,
   rubberGrip: 0.72,
-  restitution: 0.82,
+  topsheetDamping: 0.18,
+  topsheetTension: 1,
+  boosterLevel: 0,
   spongeThickness: 2.0,
   spongeHardness: 45,
   spongeDamping: 0.28,
-  bladeStiffness: 62,
-  bladeDamping: 0.16,
+  bladeStiffness: 2.6,
+  racketMass: 170,
+  bladeDamping: 0.03,
   tableFriction: 0.24,
   spinX: 0,
   spinY: 0,
@@ -153,6 +195,55 @@ const normalize = (v: Vec3): Vec3 => {
   return magnitude > 1e-9 ? scale(v, 1 / magnitude) : { x: 0, y: 0, z: 0 }
 }
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value))
+const boundedKinematicState = (initialSpeed: number, acceleration: number, time: number) => {
+  let travelTime = time
+  if (acceleration > 0 && time < 0) {
+    travelTime = Math.max(time, -initialSpeed / acceleration)
+  } else if (acceleration < 0 && time > 0) {
+    travelTime = Math.min(time, initialSpeed / -acceleration)
+  }
+  return {
+    speed: Math.max(0, initialSpeed + acceleration * travelTime),
+    distance: initialSpeed * travelTime + 0.5 * acceleration * travelTime * travelTime,
+  }
+}
+
+// Experimental covered-racket fit from Karasawa et al. (2021),
+// doi:10.1299/transjsme.21-00145. It applies to
+// stationary, normal, spin-free impacts and is used as a calibration target for
+// the more general 3D compliant-contact solver below.
+export function referenceRacketRestitution(approachSpeed: number, flexuralRigidity: number) {
+  const referenceRubberFactor = 0.88
+  return clamp(
+    1.19
+      * referenceRubberFactor
+      * Math.pow(Math.max(1, approachSpeed), -0.25)
+      * Math.pow(Math.max(0.1, flexuralRigidity), 1 / 18),
+    0.35,
+    0.92,
+  )
+}
+
+// Booster is represented as a coupled empirical treatment rather than a
+// second hardness control. At full scale it expands the sponge by 8%, lowers
+// its effective compression rating by 18%, adds 1.1 percentage points of
+// estimated topsheet pre-strain and lowers both loss factors by 25%. There is
+// no universal oil-dose conversion: these responses remain rubber-specific.
+export function effectiveRubberMaterial(params: Pick<SimParams,
+  'boosterLevel' | 'spongeHardness' | 'spongeThickness' | 'topsheetTension'
+>) {
+  const booster = clamp(params.boosterLevel, 0, 100) / 100
+  return {
+    spongeThickness: params.spongeThickness * (1 + BOOSTER_EFFECTS.thicknessExpansion * booster),
+    spongeHardness: params.spongeHardness * (1 - BOOSTER_EFFECTS.hardnessReduction * booster),
+    lossScale: 1 - BOOSTER_EFFECTS.lossReduction * booster,
+    topsheetTension: clamp(
+      params.topsheetTension + BOOSTER_EFFECTS.tensionIncrease * booster,
+      0,
+      MAX_EFFECTIVE_TOPSHEET_TENSION,
+    ),
+  }
+}
 
 // Solves the two angles (a rotation around `facePlaneAxis` then around the
 // perpendicular it produces) that steer `racketDirection` onto `targetNormal`,
@@ -398,6 +489,7 @@ export function simulate(
   }
   let normal = normalize(rotateAroundAxis(inPlaneNormal, faceTiltAxis, rad(params.faceTilt)))
   let circularCenterDirection: Vec3 = { x: 0, y: 1, z: 0 }
+  let contactRacketSpeed = params.racketSpeed
   if (params.racketPath === 'circular') {
     // The neutral clock lies parallel to the table: +X is 12 o'clock and +Z is 3 o'clock.
     // The contact tangent angle rotates that neutral clock first, so the chosen clock
@@ -430,8 +522,13 @@ export function simulate(
       : scale(clockwiseCenterDirection, -1)
     const radius = Math.max(0.05, params.racketPathRadius)
     const referenceTime = params.circleContactTime
-    const referenceDistance = params.racketSpeed * referenceTime
-      + 0.5 * params.racketAcceleration * referenceTime * referenceTime
+    const referenceMotion = boundedKinematicState(
+      params.racketSpeed,
+      params.racketAcceleration,
+      referenceTime,
+    )
+    const referenceDistance = referenceMotion.distance
+    contactRacketSpeed = referenceMotion.speed
     const contactTravelAngle = referenceDistance / radius
     racketDirection = normalize(add(
       scale(referenceTangent, Math.cos(contactTravelAngle)),
@@ -461,15 +558,19 @@ export function simulate(
     y: tablePosition.y + TABLE_SURFACE_Y + BALL_RADIUS,
     z: tablePosition.z + localStart.z,
   }
-  const contactRacketSpeed = params.racketPath === 'circular'
-    ? Math.max(0, params.racketSpeed + params.racketAcceleration * params.circleContactTime)
-    : params.racketSpeed
   const racketVelocityAtTime = (elapsed: number) => {
-    const speed = Math.max(0, contactRacketSpeed + params.racketAcceleration * elapsed)
+    // Speed is specified at impact. Once contact begins, the independent
+    // braking control replaces the pre-contact acceleration.
+    const afterContactAcceleration = -Math.max(0, params.afterContactDeceleration)
+    const speed = Math.max(0, contactRacketSpeed + afterContactAcceleration * elapsed)
     if (params.racketPath !== 'circular') return scale(racketDirection, speed)
     const radius = Math.max(0.05, params.racketPathRadius)
-    const distance = contactRacketSpeed * elapsed
-      + 0.5 * params.racketAcceleration * elapsed * elapsed
+    const stopTime = afterContactAcceleration < 0
+      ? contactRacketSpeed / -afterContactAcceleration
+      : Number.POSITIVE_INFINITY
+    const travelTime = Math.min(elapsed, stopTime)
+    const distance = contactRacketSpeed * travelTime
+      + 0.5 * afterContactAcceleration * travelTime * travelTime
     const angle = distance / radius
     const tangent = add(
       scale(racketDirection, Math.cos(angle)),
@@ -551,8 +652,8 @@ export function simulate(
         spin = frictionResult.spin
         nextPosition.y = ballOnTableY
       } else {
-        const normalImpulse = -(1 + 0.88) * velocity.y * BALL_MASS
-        velocity.y *= -0.88
+        const normalImpulse = -(1 + TABLE_RESTITUTION) * velocity.y * BALL_MASS
+        velocity.y *= -TABLE_RESTITUTION
         const frictionResult = applyTableFriction(
           velocity,
           spin,
@@ -638,41 +739,133 @@ export function simulate(
   const initialSlipVelocity = subtract(initialRelativeVelocity, initialNormalComponent)
   const slipSpeed = length(initialSlipVelocity)
 
-  // The ball, sponge and flexing blade act as springs in series. The sponge
-  // hardens sharply near bottom-out, while damping converts some stored energy
-  // into heat and blade vibration.
-  const spongeThicknessMetres = params.spongeThickness / 1000
-  const ballStiffness = 165_000
-  const spongeStiffnessBase = 285_000
-    * Math.pow(params.spongeHardness / 45, 1.55)
+  // The ball and rubber covering provide the local contact compliance. The
+  // blade is a separate, dynamically moving first bending mode rather than a
+  // massless spring: EI sets its modal stiffness, assembled-racket mass sets
+  // its modal mass, and damping is a fraction of critical damping.
+  const effectiveMaterial = effectiveRubberMaterial(params)
+  const spongeThicknessMetres = effectiveMaterial.spongeThickness / 1000
+  // Pre-strain is an estimated percent rather than a force: actual membrane
+  // tension also needs the product-specific topsheet modulus and thickness.
+  // A relaxed sheet retains its material stiffness, while pre-strain adds
+  // geometric membrane stiffness approximately in proportion to strain.
+  const relativeTension = effectiveMaterial.topsheetTension / DEFAULT_PARAMS.topsheetTension
+  // These reduced-order contact-patch stiffnesses reproduce the millisecond
+  // dwell of a 40+ ball on a rubber-covered racket. They are not bulk Young's
+  // moduli: ball-shell buckling and the growing annular contact patch are
+  // condensed into the ball term, and foam/pimple geometry into the covering.
+  const ballStiffness = 45_000
+  const referenceCoveringStiffness = 18_000
+  const spongeStiffnessBase = referenceCoveringStiffness * 0.65
+    * Math.pow(effectiveMaterial.spongeHardness / 45, 1.55)
     * (0.002 / spongeThicknessMetres)
-  const bladeStiffness = 240_000 * Math.pow(params.bladeStiffness / 62, 1.7)
-  const seriesStiffness = (spongeStiffness: number) => 1 / (
-    1 / ballStiffness + 1 / spongeStiffness + 1 / bladeStiffness
+  const topsheetNormalStiffness = referenceCoveringStiffness
+    * (0.1 + 0.25 * relativeTension)
+  const coveringStiffness = (spongeStiffness: number) => (
+    spongeStiffness + topsheetNormalStiffness
   )
-  const baseSeriesStiffness = seriesStiffness(spongeStiffnessBase)
-  const tangentialStiffness = 82_000
-    * Math.pow(params.spongeHardness / 45, 1.25)
+  const contactStiffness = (covering: number) => 1 / (
+    1 / ballStiffness + 1 / covering
+  )
+  const referenceContactStiffness = 1 / (
+    1 / ballStiffness + 1 / referenceCoveringStiffness
+  )
+  const referenceSpongeEnergyShare = referenceContactStiffness
+    * 0.65 / referenceCoveringStiffness
+  const referenceTopsheetEnergyShare = referenceContactStiffness
+    * 0.35 / referenceCoveringStiffness
+  // Measured first bending frequencies of competition blades are commonly
+  // around 70-160 Hz. A 2.6 N·m², 170 g assembled reference racket is assigned
+  // 100 Hz. Beam scaling f ∝ sqrt(EI / mass) maps the physical controls. Using
+  // assembled mass includes blade, handle, glue, sponge, and both topsheets.
+  const referenceBladeFlexuralRigidity = 2.6
+  const referenceRacketMass = 0.17
+  const referenceLoadedBladeFrequency = 100
+  const racketMass = Math.max(0.001, params.racketMass / 1000)
+  const bladeNaturalFrequency = referenceLoadedBladeFrequency
+    * Math.sqrt(Math.max(0.05, params.bladeStiffness) / referenceBladeFlexuralRigidity)
+    * Math.sqrt(referenceRacketMass / racketMass)
+  const modalMassFraction = 0.4
+  const loadedBladeModalMass = modalMassFraction * racketMass
+  const bladeModalStiffness = loadedBladeModalMass * Math.pow(2 * Math.PI * bladeNaturalFrequency, 2)
+  const bladeModalDamping = 2 * params.bladeDamping
+    * Math.sqrt(bladeModalStiffness * loadedBladeModalMass)
+  // Tangential compliance is deliberately slower than the old 82 kN/m value:
+  // its natural period now spans roughly one contact, allowing the measured
+  // grip-slip and late force-reversal behavior without artificial oscillations.
+  const referenceTangentialStiffness = 22_000
+  const spongeTangentialStiffness = referenceTangentialStiffness * 0.45
+    * Math.pow(effectiveMaterial.spongeHardness / 45, 1.25)
     * (0.002 / spongeThicknessMetres)
+  const topsheetTangentialStiffness = referenceTangentialStiffness
+    * (0.1 + 0.45 * relativeTension)
+  const tangentialStiffness = spongeTangentialStiffness + topsheetTangentialStiffness
   const tangentialEffectiveMass = 1 / (
     1 / BALL_MASS + (BALL_RADIUS * BALL_RADIUS) / BALL_INERTIA
   )
-  const tangentialDamping = 2
-    * params.spongeDamping
-    * Math.sqrt(tangentialEffectiveMass * tangentialStiffness)
-  const restitutionLog = Math.log(clamp(params.restitution, 0.05, 0.99))
-  const restitutionDampingRatio = -restitutionLog / Math.sqrt(Math.PI * Math.PI + restitutionLog * restitutionLog)
-  const normalDampingRatio = clamp(
-    restitutionDampingRatio
-      + params.spongeDamping * 0.085 * (params.spongeThickness / 2)
-      + params.bladeDamping * 0.045 * (62 / params.bladeStiffness),
-    0.015,
-    0.42,
+  const spongeTangentialEnergyFraction = spongeTangentialStiffness / tangentialStiffness
+  const topsheetTangentialEnergyFraction = topsheetTangentialStiffness / tangentialStiffness
+  const tangentialLossFactor = effectiveMaterial.lossScale * (
+    params.spongeDamping * spongeTangentialEnergyFraction
+      + params.topsheetDamping * topsheetTangentialEnergyFraction
   )
+  // For weakly damped viscoelasticity, loss factor tan(delta) is about twice
+  // the damping ratio. With c = 2*zeta*sqrt(m*k), this becomes the expression
+  // below and keeps damping consistent when shear stiffness changes.
+  const tangentialDamping = tangentialLossFactor
+    * Math.sqrt(tangentialEffectiveMass * tangentialStiffness)
+
+  // Karasawa et al.'s normal-impact fit for covered rackets:
+  // e = 1.19 * R * v^(-1/4) * EI^(1/18), with R = 0.88 for their rubber.
+  // It captures the experimentally important fall with speed and the weak but
+  // real blade-rigidity dependence. Local material controls then adjust loss
+  // about this measured reference rather than inventing a restitution input.
+  const referenceRestitution = referenceRacketRestitution(approachSpeed, params.bladeStiffness)
+  const restitutionLog = Math.log(referenceRestitution)
+  const referenceDampingRatio = -restitutionLog / Math.sqrt(
+    Math.PI * Math.PI + restitutionLog * restitutionLog,
+  )
+  // A linear Kelvin-Voigt oscillator maps damping to restitution exactly, but
+  // the real solver also includes ball buckling, foam densification and blade
+  // motion. This rate calibration makes the integrated response follow the
+  // experimental target rather than drifting upward once the foam hardens.
+  const contactModelRateCalibration = clamp(
+    0.58 + 0.13 * Math.log2(Math.max(1, approachSpeed)),
+    0.72,
+    1.25,
+  )
+  const spongeHardeningFactor = (strain: number) => {
+    // Flexible open-cell polyurethane foam enters densification at roughly
+    // 50-65% compression. Start the transition at 55%, call 65% practical
+    // bottom-out, and rise sharply beyond it instead of treating the foam as a
+    // linear spring all the way to total compression.
+    const densificationProgress = Math.max(0, (strain - 0.55) / 0.2)
+    return 1
+      + 1.2 * strain * strain
+      + 14 * Math.pow(densificationProgress, 3)
+  }
+  const solveSpongeCompression = (totalCompression: number) => {
+    let low = 0
+    let high = Math.min(totalCompression, spongeThicknessMetres * 0.999)
+    for (let iteration = 0; iteration < 18; iteration += 1) {
+      const deformation = (low + high) / 2
+      const strain = deformation / spongeThicknessMetres
+      const spongeStiffness = spongeStiffnessBase * spongeHardeningFactor(strain)
+      const coverForce = coveringStiffness(spongeStiffness) * deformation
+      const ballForce = ballStiffness * Math.max(0, totalCompression - deformation)
+      if (coverForce < ballForce) low = deformation
+      else high = deformation
+    }
+    return (low + high) / 2
+  }
 
   let outgoingVelocity = { ...incomingVelocity }
   let outgoingSpin = { ...incomingSpin }
   let compression = 0
+  let bladeDeflection = 0
+  let bladeVelocity = 0
+  let maximumBladeDeflection = 0
+  let bladeDissipatedEnergy = 0
   let shearDisplacement: Vec3 = { x: 0, y: 0, z: 0 }
   let normalImpulseMagnitude = 0
   let frictionImpulse: Vec3 = { x: 0, y: 0, z: 0 }
@@ -686,27 +879,67 @@ export function simulate(
     for (let stepIndex = 0; stepIndex < 10_000; stepIndex += 1) {
       const surfaceVelocity = add(outgoingVelocity, cross(outgoingSpin, contactArm))
       const currentRacketVelocity = racketVelocityAtTime(contactTime)
-      const relativeVelocity = subtract(surfaceVelocity, currentRacketVelocity)
+      const bladeSurfaceVelocity = subtract(currentRacketVelocity, scale(normal, bladeVelocity))
+      const relativeVelocity = subtract(surfaceVelocity, bladeSurfaceVelocity)
       const relativeNormalVelocity = dot(relativeVelocity, normal)
       const compressionRate = -relativeNormalVelocity
       compression = Math.max(0, compression + compressionRate * contactDt)
 
-      // Estimate how much of the total approach deformation sits in the sponge.
-      const baseSpongeShare = baseSeriesStiffness / spongeStiffnessBase
-      const projectedSpongeCompression = compression * baseSpongeShare
-      const bottomOutStart = spongeThicknessMetres * 0.68
-      const bottomOutProgress = Math.max(
-        0,
-        (projectedSpongeCompression - bottomOutStart) / Math.max(1e-7, spongeThicknessMetres - bottomOutStart),
+      // Solve the nonlinear deformation split between the ball shell and the
+      // covering, rather than estimating it from the undeformed stiffness.
+      const currentSpongeCompression = solveSpongeCompression(compression)
+      const spongeCompression = Math.min(
+        spongeThicknessMetres * 0.999,
+        currentSpongeCompression,
       )
-      const hardeningFactor = 1 + 24 * Math.pow(bottomOutProgress, 3)
-      const currentSpongeStiffness = spongeStiffnessBase * hardeningFactor
-      const currentStiffness = seriesStiffness(currentSpongeStiffness)
-      const normalDamping = 2 * normalDampingRatio * Math.sqrt(BALL_MASS * currentStiffness)
+      const spongeStrain = spongeCompression / spongeThicknessMetres
+      const currentSpongeStiffness = spongeStiffnessBase * spongeHardeningFactor(spongeStrain)
+      const currentCoveringStiffness = coveringStiffness(currentSpongeStiffness)
+      const currentStiffness = contactStiffness(currentCoveringStiffness)
+      const elasticNormalForce = ballStiffness * Math.max(0, compression - currentSpongeCompression)
+      // Within the covering, sponge and topsheet are parallel and share its
+      // deformation. The covering itself is in series with the ball shell.
+      // These terms are therefore the fractions of total contact energy stored
+      // by each polymer layer.
+      const spongeEnergyShare = currentStiffness
+        * currentSpongeStiffness / (currentCoveringStiffness * currentCoveringStiffness)
+      const topsheetEnergyShare = currentStiffness
+        * topsheetNormalStiffness / (currentCoveringStiffness * currentCoveringStiffness)
+      const referenceWeightedPolymerLoss = DEFAULT_PARAMS.topsheetDamping
+          * referenceTopsheetEnergyShare
+        + DEFAULT_PARAMS.spongeDamping * referenceSpongeEnergyShare
+      const weightedPolymerLoss = effectiveMaterial.lossScale * (
+        params.topsheetDamping * topsheetEnergyShare
+          + params.spongeDamping * spongeEnergyShare
+      )
+      const relativePolymerLoss = weightedPolymerLoss / referenceWeightedPolymerLoss
+      // The empirical COR already contains reference ball and rubber losses,
+      // so only 45% of its damping is adjusted by the exposed polymer factors.
+      // This avoids double-counting while leaving both loss controls material.
+      const normalDampingRatio = clamp(
+        referenceDampingRatio
+          * contactModelRateCalibration
+          * (0.55 + 0.45 * relativePolymerLoss),
+        0.015,
+        0.5,
+      )
+      const normalDamping = 2
+        * normalDampingRatio
+        * Math.sqrt(BALL_MASS * currentStiffness)
       const normalForceMagnitude = Math.max(
         0,
-        currentStiffness * compression + normalDamping * compressionRate,
+        elasticNormalForce + normalDamping * compressionRate,
       )
+
+      const bladeAcceleration = (
+        normalForceMagnitude
+          - bladeModalDamping * bladeVelocity
+          - bladeModalStiffness * bladeDeflection
+      ) / loadedBladeModalMass
+      bladeDissipatedEnergy += bladeModalDamping * bladeVelocity * bladeVelocity * contactDt
+      bladeVelocity += bladeAcceleration * contactDt
+      bladeDeflection += bladeVelocity * contactDt
+      maximumBladeDeflection = Math.max(maximumBladeDeflection, bladeDeflection)
 
       const normalPart = scale(normal, relativeNormalVelocity)
       const slipVelocity = subtract(relativeVelocity, normalPart)
@@ -741,14 +974,10 @@ export function simulate(
       normalImpulseMagnitude += normalForceMagnitude * contactDt
       frictionImpulse = add(frictionImpulse, scale(tangentialForce, contactDt))
       peakNormalForce = Math.max(peakNormalForce, normalForceMagnitude)
-      const estimatedSpongeCompression = Math.min(
-        spongeThicknessMetres,
-        normalForceMagnitude / Math.max(1, currentSpongeStiffness),
-      )
-      maximumSpongeCompression = Math.max(maximumSpongeCompression, estimatedSpongeCompression)
+      maximumSpongeCompression = Math.max(maximumSpongeCompression, spongeCompression)
       maximumCompressionRatio = Math.max(
         maximumCompressionRatio,
-        projectedSpongeCompression / spongeThicknessMetres,
+        spongeCompression / (spongeThicknessMetres * SPONGE_BOTTOM_OUT_STRAIN),
       )
       contactTime += contactDt
 
@@ -830,7 +1059,7 @@ export function simulate(
       const speedBefore = length(velocity)
       const tableNormalImpulse = supported
         ? BALL_MASS * G * dt
-        : -(1 + 0.88) * velocity.y * BALL_MASS
+        : -(1 + TABLE_RESTITUTION) * velocity.y * BALL_MASS
       velocity.y = supported ? 0 : velocity.y + tableNormalImpulse / BALL_MASS
       const frictionResult = applyTableFriction(
         velocity,
@@ -917,9 +1146,16 @@ export function simulate(
       peakNormalForce,
       contactTime,
       effectiveRestitution,
+      effectiveTopsheetTension: effectiveMaterial.topsheetTension,
+      effectiveSpongeThickness: effectiveMaterial.spongeThickness,
+      effectiveSpongeHardness: effectiveMaterial.spongeHardness,
       spongeCompression: maximumSpongeCompression * 1000,
-      spongeCompressionRatio: maximumCompressionRatio,
-      bottomedOut: maximumCompressionRatio >= 0.92,
+      spongeUsableTravel: effectiveMaterial.spongeThickness * SPONGE_BOTTOM_OUT_STRAIN,
+      spongeCompressionRatio: Math.min(1, maximumCompressionRatio),
+      bladeNaturalFrequency,
+      bladeDeflection: maximumBladeDeflection * 1000,
+      bladeDissipatedEnergy: bladeDissipatedEnergy * 1000,
+      bottomedOut: maximumCompressionRatio >= 1,
       outgoingSpeed: length(outgoingVelocity),
       elevation: Math.atan2(outgoingVelocity.y, horizontalSpeed) * 180 / Math.PI,
       sidespinRpm: outgoingSpin.y * spinRpmFactor,

@@ -28,9 +28,11 @@ import {
 } from 'lucide-react'
 import {
   BALL_RADIUS,
+  BOOSTER_EFFECTS,
   DEFAULT_BALL_START,
   DEFAULT_PARAMS,
   DEFAULT_TABLE_POSITION,
+  MATERIAL_LIMITS,
   NET_HEIGHT,
   NET_WIDTH,
   SIM_START_TIME,
@@ -42,6 +44,7 @@ import {
   simulate,
   solveCircularContactParams,
   solveLinearContactParams,
+  type CircleDirection,
   type SimParams,
   type SimResult,
   type BallStart,
@@ -50,6 +53,7 @@ import {
 
 const DEFAULT_START_TIME = SIM_START_TIME
 const STEP = 1 / 120
+const ANGLE_STEP = 0.1
 const MAX_SPEED_MPS = 100 / 3.6
 const SCENE_CENTER: Vec3 = { x: 0, y: TABLE_SURFACE_Y, z: 0 }
 
@@ -67,6 +71,9 @@ const STROKE_BENCHMARKS = [
   { stroke: 'Loop', speed: [12.3, 23.6], approximate: false, spin: '6,200–8,800', direction: 'top' },
   { stroke: 'Flick', speed: [12.02, 12.02], approximate: true, spin: '4,600–7,200', direction: 'top / side' },
 ] as const
+
+const ELITE_TOPSPIN_RACKET_SPEED = [15, 20] as const
+const ELITE_TOPSPIN_RACKET_ACCELERATION = [150, 180] as const
 
 const formatBenchmarkSpeed = (
   speed: readonly [number, number],
@@ -101,6 +108,18 @@ const defaultZoomDistance = (preset: CameraPreset) => {
 
 const toArray = (v: Vec3): [number, number, number] => [v.x, v.y, v.z]
 const magnitude = (v: Vec3) => Math.hypot(v.x, v.y, v.z)
+const boundedKinematicState = (initialSpeed: number, acceleration: number, time: number) => {
+  let travelTime = time
+  if (acceleration > 0 && time < 0) {
+    travelTime = Math.max(time, -initialSpeed / acceleration)
+  } else if (acceleration < 0 && time > 0) {
+    travelTime = Math.min(time, initialSpeed / -acceleration)
+  }
+  return {
+    speed: Math.max(0, initialSpeed + acceleration * travelTime),
+    distance: initialSpeed * travelTime + 0.5 * acceleration * travelTime * travelTime,
+  }
+}
 
 function TableIcon({ size = 18 }: { size?: number }) {
   return (
@@ -260,8 +279,12 @@ function Slider({
   unit,
   defaultValue,
   displayScale = 1,
+  effectiveValue,
+  effectiveMin,
+  effectiveMax,
   accent = 'mint',
   onChange,
+  onEffectiveChange,
 }: {
   label: string
   value: number
@@ -271,22 +294,40 @@ function Slider({
   unit: string
   defaultValue: number
   displayScale?: number
+  effectiveValue?: number
+  effectiveMin?: number
+  effectiveMax?: number
   accent?: 'mint' | 'coral' | 'violet'
   onChange: (value: number) => void
+  onEffectiveChange?: (value: number) => void
 }) {
   const progress = ((value - min) / (max - min)) * 100
+  const effectiveProgress = effectiveValue === undefined
+    ? progress
+    : Math.max(0, Math.min(100, (effectiveValue - min) / (max - min) * 100))
+  const hasEffectiveValue = effectiveValue !== undefined && Math.abs(effectiveValue - value) > 1e-9
+  const boostStart = Math.min(progress, effectiveProgress)
+  const boostEnd = Math.max(progress, effectiveProgress)
   const displayedStep = step * displayScale
+  const shownValue = (effectiveValue ?? value) * displayScale
+  const shownMin = (effectiveMin ?? min) * displayScale
+  const shownMax = (effectiveMax ?? max) * displayScale
   return (
     <div className="control-row">
       <span className="control-label">{label}</span>
       <EditableValue
         label={label}
-        value={value * displayScale}
-        min={min * displayScale}
-        max={max * displayScale}
+        value={shownValue}
+        min={shownMin}
+        max={shownMax}
         step={displayedStep}
         unit={unit}
-        onChange={(displayedValue) => onChange(displayedValue / displayScale)}
+        className={hasEffectiveValue ? 'control-value effective-control-value' : 'control-value'}
+        onChange={(displayedValue) => {
+          const nextValue = displayedValue / displayScale
+          if (hasEffectiveValue && onEffectiveChange) onEffectiveChange(nextValue)
+          else onChange(nextValue)
+        }}
       />
       <button
         type="button"
@@ -298,17 +339,26 @@ function Slider({
       >
         <RotateCcw size={12} strokeWidth={3.2} />
       </button>
-      <input
-        className={`range range-${accent}`}
-        style={{ '--progress': `${progress}%` } as React.CSSProperties}
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
-        onDoubleClick={() => onChange(defaultValue)}
-      />
+      <div className="range-shell">
+        <input
+          className={`range range-${accent}${hasEffectiveValue ? ' range-boosted' : ''}`}
+          style={{
+            '--progress': `${progress}%`,
+            '--boost-start': `${boostStart}%`,
+            '--boost-end': `${boostEnd}%`,
+          } as React.CSSProperties}
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(event) => onChange(Number(event.target.value))}
+          onDoubleClick={() => onChange(defaultValue)}
+        />
+        {hasEffectiveValue && (
+          <i className="boost-effective-marker" style={{ left: `${effectiveProgress}%` }} aria-hidden="true" />
+        )}
+      </div>
       <span className="range-bounds">
         <i>{Number((min * displayScale).toFixed(1))}</i>
         <i>{Number((max * displayScale).toFixed(1))}</i>
@@ -762,8 +812,11 @@ const circularPathFrame = (params: SimParams) => {
   if (params.circleDirection === 'counterclockwise') referenceCenterDirection.negate()
   const radius = Math.max(0.05, params.racketPathRadius)
   const referenceTime = params.circleContactTime
-  const referenceDistance = params.racketSpeed * referenceTime
-    + 0.5 * params.racketAcceleration * referenceTime * referenceTime
+  const referenceDistance = boundedKinematicState(
+    params.racketSpeed,
+    params.racketAcceleration,
+    referenceTime,
+  ).distance
   const contactTravelAngle = referenceDistance / radius
   const tangent = referenceTangent.clone().multiplyScalar(Math.cos(contactTravelAngle))
     .addScaledVector(referenceCenterDirection, Math.sin(contactTravelAngle))
@@ -825,7 +878,11 @@ function racketPoseAtTime(
   params: SimParams,
 ) {
   const speed = magnitude(impactVelocity)
-  const displacement = speed * time + 0.5 * params.racketAcceleration * time * time
+  // Each phase stops at zero speed instead of allowing the quadratic path to
+  // reverse. Acceleration owns t < 0; independent braking owns t > 0.
+  const displacement = time <= 0
+    ? boundedKinematicState(speed, params.racketAcceleration, time).distance
+    : boundedKinematicState(speed, -Math.max(0, params.afterContactDeceleration), time).distance
   const position = new THREE.Vector3(contactPoint.x, contactPoint.y, contactPoint.z)
 
   if (params.racketPath === 'circular') {
@@ -1666,6 +1723,7 @@ function App() {
   const [darkMode, setDarkMode] = useState(false)
   const [speedUnit, setSpeedUnit] = useState<SpeedUnit>('km/h')
   const [handleSide, setHandleSide] = useState<'left' | 'right'>('left')
+  const [convertCircleDirection, setConvertCircleDirection] = useState(true)
   const [cameraPov, setCameraPov] = useState<CameraPov>(() => {
     const direction = new THREE.Vector3(5.8, 3.7, -6.5)
       .sub(new THREE.Vector3(SCENE_CENTER.x, SCENE_CENTER.y, SCENE_CENTER.z))
@@ -1678,6 +1736,10 @@ function App() {
   const lastFrameRef = useRef<number | null>(null)
   const tablePosition = DEFAULT_TABLE_POSITION
   const result = useMemo(() => simulate(params, tablePosition, ballStart), [params, ballStart, tablePosition])
+  const boosterFraction = Math.max(0, Math.min(100, params.boosterLevel)) / 100
+  const boostedThicknessScale = 1 + BOOSTER_EFFECTS.thicknessExpansion * boosterFraction
+  const boostedHardnessScale = 1 - BOOSTER_EFFECTS.hardnessReduction * boosterFraction
+  const boostedTensionIncrease = BOOSTER_EFFECTS.tensionIncrease * boosterFraction
   const startTime = result.startTime
   const endTime = result.outgoing[result.outgoing.length - 1].t
   const circleFrame = useMemo(() => circularPathFrame(params), [params])
@@ -1709,15 +1771,21 @@ function App() {
     })
     setPlaying(false)
   }, [result])
-  const flipCircleDirection = useCallback(() => {
+  const selectCircleDirection = useCallback((topDownDirection: CircleDirection) => {
+    const requestedDirection = circleFrame.topDownFlipped
+      ? topDownDirection === 'clockwise' ? 'counterclockwise' : 'clockwise'
+      : topDownDirection
     setParams((current) => {
-      const flipped = current.circleDirection === 'clockwise' ? 'counterclockwise' : 'clockwise'
+      if (current.circleDirection === requestedDirection) return current
+      if (!convertCircleDirection) {
+        return { ...current, circleDirection: requestedDirection }
+      }
       const { racketVelocity, normal } = result.impact
-      const solved = solveCircularContactParams(racketVelocity, normal, flipped)
-      return { ...current, circleDirection: flipped, ...solved }
+      const solved = solveCircularContactParams(racketVelocity, normal, requestedDirection)
+      return { ...current, circleDirection: requestedDirection, ...solved }
     })
     setPlaying(false)
-  }, [result])
+  }, [circleFrame.topDownFlipped, convertCircleDirection, result])
   const reportZoom = useCallback((level: number) => {
     setZoomLevel((current) => Math.abs(current - level) > 0.1 ? level : current)
   }, [])
@@ -1841,8 +1909,8 @@ function App() {
           <Section icon={<Circle size={18} />} eyebrow="01" title="Ball" tone="coral">
             <BallStartPicker value={ballStart} cameraPov={cameraPov} onChange={(value) => { setBallStart(value); setPlaying(false); setTime(startTime) }} />
             <Slider label="Speed" value={params.ballSpeed} defaultValue={DEFAULT_PARAMS.ballSpeed} displayScale={speedScale} min={0} max={MAX_SPEED_MPS} step={speedUnit === 'km/h' ? 0.1 / 3.6 : 0.1} unit={speedUnit} accent="coral" onChange={(v) => updateParam('ballSpeed', v)} />
-            <Slider label="Initial side angle" value={params.ballAzimuth} defaultValue={DEFAULT_PARAMS.ballAzimuth} min={-90} max={90} step={1} unit="°" accent="coral" onChange={(v) => updateParam('ballAzimuth', v)} />
-            <Slider label="Initial vertical angle" value={params.ballElevation} defaultValue={DEFAULT_PARAMS.ballElevation} min={0} max={180} step={1} unit="°" accent="coral" onChange={(v) => updateParam('ballElevation', v)} />
+            <Slider label="Initial side angle" value={params.ballAzimuth} defaultValue={DEFAULT_PARAMS.ballAzimuth} min={-90} max={90} step={ANGLE_STEP} unit="°" accent="coral" onChange={(v) => updateParam('ballAzimuth', v)} />
+            <Slider label="Initial vertical angle" value={params.ballElevation} defaultValue={DEFAULT_PARAMS.ballElevation} min={0} max={180} step={ANGLE_STEP} unit="°" accent="coral" onChange={(v) => updateParam('ballElevation', v)} />
             <div className="sub-label">INITIAL SPIN</div>
             <Slider label={rollLabel} value={params.spinX} defaultValue={DEFAULT_PARAMS.spinX} min={-5000} max={5000} step={100} unit="rpm" accent="coral" onChange={(v) => updateParam('spinX', v)} />
             <Slider label={sidespinLabel} value={params.spinY} defaultValue={DEFAULT_PARAMS.spinY} min={-5000} max={5000} step={100} unit="rpm" accent="coral" onChange={(v) => updateParam('spinY', v)} />
@@ -1858,7 +1926,8 @@ function App() {
 
           <Section icon={<RacketIcon size={18} />} eyebrow="02" title="Racket" tone="violet">
             <Slider label="Speed" value={params.racketSpeed} defaultValue={DEFAULT_PARAMS.racketSpeed} displayScale={speedScale} min={0} max={MAX_SPEED_MPS} step={speedUnit === 'km/h' ? 0.1 / 3.6 : 0.1} unit={speedUnit} accent="violet" onChange={(v) => updateParam('racketSpeed', v)} />
-            <Slider label="Acceleration" value={params.racketAcceleration} defaultValue={DEFAULT_PARAMS.racketAcceleration} min={-100} max={100} step={0.5} unit="m/s²" accent="violet" onChange={(v) => updateParam('racketAcceleration', v)} />
+            <Slider label="Acceleration" value={params.racketAcceleration} defaultValue={DEFAULT_PARAMS.racketAcceleration} min={-250} max={250} step={0.5} unit="m/s²" accent="violet" onChange={(v) => updateParam('racketAcceleration', v)} />
+            <Slider label="After-contact deceleration" value={params.afterContactDeceleration} defaultValue={DEFAULT_PARAMS.afterContactDeceleration} min={0} max={1000} step={1} unit="m/s²" accent="violet" onChange={(v) => updateParam('afterContactDeceleration', v)} />
             <div className="binary-control">
               <span>Path shape</span>
               <div>
@@ -1881,8 +1950,8 @@ function App() {
             />
             {params.racketPath === 'linear' ? (
               <>
-                <Slider label="Path side" value={params.pathAzimuth} defaultValue={DEFAULT_PARAMS.pathAzimuth} min={-180} max={180} step={1} unit="°" accent="violet" onChange={(v) => updateParam('pathAzimuth', v)} />
-                <Slider label="Path lift" value={params.pathElevation} defaultValue={DEFAULT_PARAMS.pathElevation} min={-90} max={180} step={1} unit="°" accent="violet" onChange={(v) => updateParam('pathElevation', v)} />
+                <Slider label="Path side" value={params.pathAzimuth} defaultValue={DEFAULT_PARAMS.pathAzimuth} min={-180} max={180} step={ANGLE_STEP} unit="°" accent="violet" onChange={(v) => updateParam('pathAzimuth', v)} />
+                <Slider label="Path lift" value={params.pathElevation} defaultValue={DEFAULT_PARAMS.pathElevation} min={-90} max={180} step={ANGLE_STEP} unit="°" accent="violet" onChange={(v) => updateParam('pathElevation', v)} />
               </>
             ) : (
               <>
@@ -1894,18 +1963,18 @@ function App() {
                       className={topDownCircleDirection === 'clockwise' ? 'active' : ''}
                       aria-label="Clockwise from top view"
                       title="Clockwise from top view"
-                      onClick={() => updateParam(
-                        'circleDirection',
-                        circleFrame.topDownFlipped ? 'counterclockwise' : 'clockwise',
-                      )}
+                      onClick={() => selectCircleDirection('clockwise')}
                     >
                       <RotateCw size={13} /> CW
                     </button>
                     <button
-                      className="convert-direction"
-                      aria-label="Convert to the opposite winding direction, solving parameters to keep the same contact"
-                      title="Convert to the opposite winding direction, solving parameters to keep the same contact"
-                      onClick={flipCircleDirection}
+                      className={`convert-direction ${convertCircleDirection ? 'active' : ''}`}
+                      aria-label="Preserve contact geometry when changing clockwise or counterclockwise direction"
+                      aria-pressed={convertCircleDirection}
+                      title={convertCircleDirection
+                        ? 'Direction conversion on · preserve contact geometry'
+                        : 'Direction conversion off · change raw winding only'}
+                      onClick={() => setConvertCircleDirection((enabled) => !enabled)}
                     >
                       <ArrowLeftRight size={13} />
                     </button>
@@ -1913,16 +1982,13 @@ function App() {
                       className={topDownCircleDirection === 'counterclockwise' ? 'active' : ''}
                       aria-label="Counterclockwise from top view"
                       title="Counterclockwise from top view"
-                      onClick={() => updateParam(
-                        'circleDirection',
-                        circleFrame.topDownFlipped ? 'clockwise' : 'counterclockwise',
-                      )}
+                      onClick={() => selectCircleDirection('counterclockwise')}
                     >
                       <RotateCcw size={13} /> CCW
                     </button>
                   </div>
                 </div>
-                <Slider label={`Contact tangent · ${formatClockPosition(params.circleContactAngle)}`} value={params.circleContactAngle} defaultValue={DEFAULT_PARAMS.circleContactAngle} min={-180} max={180} step={1} unit="°" accent="violet" onChange={(v) => updateParam('circleContactAngle', v)} />
+                <Slider label={`Contact tangent · ${formatClockPosition(params.circleContactAngle)}`} value={params.circleContactAngle} defaultValue={DEFAULT_PARAMS.circleContactAngle} min={-180} max={180} step={ANGLE_STEP} unit="°" accent="violet" onChange={(v) => updateParam('circleContactAngle', v)} />
                 <Slider
                   label={`Contact point after tangent · ${formatClockPosition(contactTimingClockAngle)}`}
                   value={params.circleContactTime}
@@ -1935,13 +2001,13 @@ function App() {
                   accent="violet"
                   onChange={(v) => updateParam('circleContactTime', v)}
                 />
-                <Slider label="Left / right tilt · 12–6 axis" value={params.circleSideTilt} defaultValue={DEFAULT_PARAMS.circleSideTilt} min={-180} max={180} step={1} unit="°" accent="violet" onChange={(v) => updateParam('circleSideTilt', v)} />
-                <Slider label="Lift · 3–9 axis" value={params.circleLift} defaultValue={DEFAULT_PARAMS.circleLift} min={-180} max={180} step={1} unit="°" accent="violet" onChange={(v) => updateParam('circleLift', v)} />
+                <Slider label="Left / right tilt · 12–6 axis" value={params.circleSideTilt} defaultValue={DEFAULT_PARAMS.circleSideTilt} min={-180} max={180} step={ANGLE_STEP} unit="°" accent="violet" onChange={(v) => updateParam('circleSideTilt', v)} />
+                <Slider label="Lift · 3–9 axis" value={params.circleLift} defaultValue={DEFAULT_PARAMS.circleLift} min={-180} max={180} step={ANGLE_STEP} unit="°" accent="violet" onChange={(v) => updateParam('circleLift', v)} />
               </>
             )}
             <div className="sub-label">FACE RELATIVE TO PATH</div>
-            <Slider label={params.racketPath === 'circular' ? 'Hook' : 'Face yaw'} value={params.facePathAngle} defaultValue={DEFAULT_PARAMS.facePathAngle} min={-180} max={180} step={1} unit="°" accent="violet" onChange={(v) => updateParam('facePathAngle', v)} />
-            <Slider label="Face tilt" value={params.faceTilt} defaultValue={DEFAULT_PARAMS.faceTilt} min={-180} max={180} step={1} unit="°" accent="violet" onChange={(v) => updateParam('faceTilt', v)} />
+            <Slider label={params.racketPath === 'circular' ? 'Hook' : 'Face yaw'} value={params.facePathAngle} defaultValue={DEFAULT_PARAMS.facePathAngle} min={-180} max={180} step={ANGLE_STEP} unit="°" accent="violet" onChange={(v) => updateParam('facePathAngle', v)} />
+            <Slider label="Face tilt" value={params.faceTilt} defaultValue={DEFAULT_PARAMS.faceTilt} min={-180} max={180} step={ANGLE_STEP} unit="°" accent="violet" onChange={(v) => updateParam('faceTilt', v)} />
             <div className="binary-control">
               <span>Handle side</span>
               <div>
@@ -1953,17 +2019,59 @@ function App() {
           </Section>
 
           <Section icon={<Layers3 size={18} />} eyebrow="MATERIAL" title="Rubber & Sponge" tone="mint">
-            <Slider label="Grip · μ" value={params.rubberGrip} defaultValue={DEFAULT_PARAMS.rubberGrip} min={0.05} max={1.3} step={0.01} unit="" accent="mint" onChange={(v) => updateParam('rubberGrip', v)} />
-            <Slider label="Topsheet bounce · e" value={params.restitution} defaultValue={DEFAULT_PARAMS.restitution} min={0.2} max={0.95} step={0.01} unit="" accent="mint" onChange={(v) => updateParam('restitution', v)} />
+            <Slider label="Effective grip · μ" value={params.rubberGrip} defaultValue={DEFAULT_PARAMS.rubberGrip} {...MATERIAL_LIMITS.rubberGrip} unit="" accent="mint" onChange={(v) => updateParam('rubberGrip', v)} />
+            <Slider label="Topsheet loss factor" value={params.topsheetDamping} defaultValue={DEFAULT_PARAMS.topsheetDamping} {...MATERIAL_LIMITS.topsheetDamping} unit="tan δ" accent="mint" onChange={(v) => updateParam('topsheetDamping', v)} />
+            <Slider
+              label="Estimated topsheet pre-strain"
+              value={params.topsheetTension}
+              effectiveValue={result.impact.effectiveTopsheetTension}
+              effectiveMin={boostedTensionIncrease}
+              effectiveMax={MATERIAL_LIMITS.topsheetTension.max + boostedTensionIncrease}
+              defaultValue={DEFAULT_PARAMS.topsheetTension}
+              {...MATERIAL_LIMITS.topsheetTension}
+              unit="%"
+              accent="mint"
+              onChange={(v) => updateParam('topsheetTension', v)}
+              onEffectiveChange={(v) => updateParam(
+                'topsheetTension',
+                Math.max(0, Math.min(MATERIAL_LIMITS.topsheetTension.max, v - boostedTensionIncrease)),
+              )}
+            />
+            <Slider label="Booster treatment · empirical" value={params.boosterLevel} defaultValue={DEFAULT_PARAMS.boosterLevel} {...MATERIAL_LIMITS.boosterLevel} unit="%" accent="mint" onChange={(v) => updateParam('boosterLevel', v)} />
             <div className="sub-label">SPONGE</div>
-            <Slider label="Thickness" value={params.spongeThickness} defaultValue={DEFAULT_PARAMS.spongeThickness} min={1} max={2.3} step={0.1} unit="mm" accent="mint" onChange={(v) => updateParam('spongeThickness', v)} />
-            <Slider label="Hardness" value={params.spongeHardness} defaultValue={DEFAULT_PARAMS.spongeHardness} min={25} max={60} step={1} unit="relative" accent="mint" onChange={(v) => updateParam('spongeHardness', v)} />
-            <Slider label="Energy loss" value={params.spongeDamping} defaultValue={DEFAULT_PARAMS.spongeDamping} min={0.05} max={0.55} step={0.01} unit="" accent="mint" onChange={(v) => updateParam('spongeDamping', v)} />
+            <Slider
+              label="Sponge thickness"
+              value={params.spongeThickness}
+              effectiveValue={result.impact.effectiveSpongeThickness}
+              effectiveMin={MATERIAL_LIMITS.spongeThickness.min * boostedThicknessScale}
+              effectiveMax={MATERIAL_LIMITS.spongeThickness.max * boostedThicknessScale}
+              defaultValue={DEFAULT_PARAMS.spongeThickness}
+              {...MATERIAL_LIMITS.spongeThickness}
+              unit="mm"
+              accent="mint"
+              onChange={(v) => updateParam('spongeThickness', v)}
+              onEffectiveChange={(v) => updateParam('spongeThickness', v / boostedThicknessScale)}
+            />
+            <Slider
+              label="Nominal sponge hardness"
+              value={params.spongeHardness}
+              effectiveValue={result.impact.effectiveSpongeHardness}
+              effectiveMin={MATERIAL_LIMITS.spongeHardness.min * boostedHardnessScale}
+              effectiveMax={MATERIAL_LIMITS.spongeHardness.max * boostedHardnessScale}
+              defaultValue={DEFAULT_PARAMS.spongeHardness}
+              {...MATERIAL_LIMITS.spongeHardness}
+              unit="°"
+              accent="mint"
+              onChange={(v) => updateParam('spongeHardness', v)}
+              onEffectiveChange={(v) => updateParam('spongeHardness', v / boostedHardnessScale)}
+            />
+            <Slider label="Sponge loss factor" value={params.spongeDamping} defaultValue={DEFAULT_PARAMS.spongeDamping} {...MATERIAL_LIMITS.spongeDamping} unit="tan δ" accent="mint" onChange={(v) => updateParam('spongeDamping', v)} />
           </Section>
 
           <Section icon={<Layers3 size={18} />} eyebrow="MATERIAL" title="Blade" tone="violet">
-            <Slider label="Flexural stiffness" value={params.bladeStiffness} defaultValue={DEFAULT_PARAMS.bladeStiffness} min={25} max={100} step={1} unit="relative" accent="violet" onChange={(v) => updateParam('bladeStiffness', v)} />
-            <Slider label="Vibration loss" value={params.bladeDamping} defaultValue={DEFAULT_PARAMS.bladeDamping} min={0.02} max={0.5} step={0.01} unit="" accent="violet" onChange={(v) => updateParam('bladeDamping', v)} />
+            <Slider label={`Flexural rigidity · ~${result.impact.bladeNaturalFrequency.toFixed(0)} Hz loaded`} value={params.bladeStiffness} defaultValue={DEFAULT_PARAMS.bladeStiffness} {...MATERIAL_LIMITS.bladeStiffness} unit="N·m²" accent="violet" onChange={(v) => updateParam('bladeStiffness', v)} />
+            <Slider label="Assembled racket mass" value={params.racketMass} defaultValue={DEFAULT_PARAMS.racketMass} {...MATERIAL_LIMITS.racketMass} unit="g" accent="violet" onChange={(v) => updateParam('racketMass', v)} />
+            <Slider label="Modal damping" value={params.bladeDamping} defaultValue={DEFAULT_PARAMS.bladeDamping} {...MATERIAL_LIMITS.bladeDamping} displayScale={100} unit="% critical" accent="violet" onChange={(v) => updateParam('bladeDamping', v)} />
           </Section>
 
           <Section icon={<TableIcon size={18} />} eyebrow="MATERIAL" title="Table" tone="mint">
@@ -2132,7 +2240,13 @@ function App() {
           </div>
 
           <div className="impact-card">
-            <div className="card-title"><span>Total spin</span><i>{Math.round(result.impact.totalSpinRpm).toLocaleString()} rpm</i></div>
+            <div className="card-title spin-card-title">
+              <span>TOTAL SPIN</span>
+              <div className="total-spin-value">
+                <strong>{Math.round(result.impact.totalSpinRpm).toLocaleString()}</strong>
+                <small>rpm</small>
+              </div>
+            </div>
             <div className="spin-readout">
               <div><span>ROLL</span><strong>{Math.round(Math.abs(impactRollRpm)).toLocaleString()}</strong><small>rpm · {impactRollDirection}</small></div>
               <div><span>{impactSidespinHeader}</span><strong>{Math.round(Math.abs(result.impact.sidespinRpm)).toLocaleString()}</strong><small>rpm</small></div>
@@ -2140,8 +2254,49 @@ function App() {
             </div>
           </div>
 
+          <div className="force-card">
+            <div className="card-title"><Gauge size={17} /><span>Impact forces</span><i>{(result.impact.contactTime * 1000).toFixed(2)} ms dwell</i></div>
+            <div className="force-readout">
+              <div><span>Peak normal</span><strong>{result.impact.peakNormalForce.toFixed(1)} N</strong></div>
+              <div><span>Mean friction</span><strong>{result.impact.frictionForce.toFixed(1)} N</strong></div>
+            </div>
+            <div className="force-track"><i style={{ width: `${forceRatio}%` }} /></div>
+          </div>
+
+          <div className={`material-card ${result.impact.bottomedOut ? 'bottomed' : ''}`}>
+            <div className="card-title"><Layers3 size={17} /><span>Material response</span><i>e = {result.impact.effectiveRestitution.toFixed(2)}</i></div>
+            <div className="compression-label">
+              <span>Sponge compression</span>
+              <strong>{result.impact.spongeCompression.toFixed(2)} / {result.impact.spongeUsableTravel.toFixed(2)} mm usable</strong>
+            </div>
+            <div className="compression-track"><i style={{ width: `${Math.min(100, result.impact.spongeCompressionRatio * 100)}%` }} /></div>
+            <div className="material-state">
+              <span>{result.impact.bottomedOut ? 'Bottom-out engaged' : 'Within elastic travel'}</span>
+              <strong>{Math.round(result.impact.spongeCompressionRatio * 100)}%</strong>
+            </div>
+            <div className="material-state blade-state">
+              <span>Loaded blade mode</span>
+              <strong>{result.impact.bladeNaturalFrequency.toFixed(0)} Hz · {result.impact.bladeDeflection.toFixed(2)} mm</strong>
+            </div>
+          </div>
+
           <div className="exit-benchmarks">
             <span className="kicker">ELITE STROKE REFERENCE</span>
+            <div className="benchmark-subhead">RACKET AT IMPACT</div>
+            <div className="elite-swing-reference">
+              <div>
+                <span>Speed</span>
+                <strong>{formatBenchmarkSpeed(ELITE_TOPSPIN_RACKET_SPEED, false, speedUnit)}</strong>
+                <small>{speedUnit} · at impact</small>
+              </div>
+              <div>
+                <span>Acceleration</span>
+                <strong>{ELITE_TOPSPIN_RACKET_ACCELERATION[0]}–{ELITE_TOPSPIN_RACKET_ACCELERATION[1]}</strong>
+                <small>m/s² · at impact</small>
+              </div>
+            </div>
+            <p className="benchmark-note">Representative measured elite topspin values for resultant racket motion.</p>
+            <div className="benchmark-subhead ball-benchmark-subhead">BALL AFTER IMPACT</div>
             <div className="stroke-benchmarks" aria-label="Representative elite table tennis stroke speed and spin benchmarks">
               <div className="stroke-benchmark-head" aria-hidden="true">
                 <span>Stroke</span>
@@ -2159,28 +2314,6 @@ function App() {
             <p className="benchmark-note">Representative post-contact measurements, not limits. Push uses a practical short-push reference.</p>
           </div>
 
-          <div className="force-card">
-            <div className="card-title"><Gauge size={17} /><span>Impact forces</span><i>{(result.impact.contactTime * 1000).toFixed(2)} ms dwell</i></div>
-            <div className="force-readout">
-              <div><span>Peak normal</span><strong>{result.impact.peakNormalForce.toFixed(1)} N</strong></div>
-              <div><span>Mean friction</span><strong>{result.impact.frictionForce.toFixed(1)} N</strong></div>
-            </div>
-            <div className="force-track"><i style={{ width: `${forceRatio}%` }} /></div>
-          </div>
-
-          <div className={`material-card ${result.impact.bottomedOut ? 'bottomed' : ''}`}>
-            <div className="card-title"><Layers3 size={17} /><span>Material response</span><i>e = {result.impact.effectiveRestitution.toFixed(2)}</i></div>
-            <div className="compression-label">
-              <span>Sponge compression</span>
-              <strong>{result.impact.spongeCompression.toFixed(2)} / {params.spongeThickness.toFixed(1)} mm</strong>
-            </div>
-            <div className="compression-track"><i style={{ width: `${Math.min(100, result.impact.spongeCompressionRatio * 100)}%` }} /></div>
-            <div className="material-state">
-              <span>{result.impact.bottomedOut ? 'Bottom-out engaged' : 'Within elastic travel'}</span>
-              <strong>{Math.round(result.impact.spongeCompressionRatio * 100)}%</strong>
-            </div>
-          </div>
-
           <div className="contact-card">
             <Target size={19} />
             <div><strong>Calculated impact location</strong><span>X {result.impact.contactPoint.x.toFixed(2)} · Y {result.impact.contactPoint.y.toFixed(2)} · Z {result.impact.contactPoint.z.toFixed(2)} m</span></div>
@@ -2188,7 +2321,7 @@ function App() {
 
           <div className="model-note">
             <Info size={16} />
-            <p><strong>Model note</strong> The 2.7 g ball contacts nonlinear sponge and blade springs. Tangential shear is stored during dwell and capped by Coulomb friction.</p>
+            <p><strong>Model note</strong> The 2.7 g ball shell and rubber contact patch use measured speed-dependent rebound behavior. A progressively hardening sponge acts in parallel with a pre-strained topsheet, while the blade responds as a damped first bending mode derived from flexural rigidity and assembled-racket mass. Booster changes are product-specific estimates, and post-factory treatment is not competition-legal. Tangential shear stores and returns energy during grip, with sliding capped by effective friction.</p>
           </div>
           </>
           )}

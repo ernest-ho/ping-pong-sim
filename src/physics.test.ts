@@ -4,7 +4,9 @@ import {
   DEFAULT_BALL_START,
   DEFAULT_PARAMS,
   DEFAULT_TABLE_POSITION,
+  MATERIAL_LIMITS,
   NET_HEIGHT,
+  referenceRacketRestitution,
   TABLE_LENGTH,
   TABLE_SURFACE_Y,
   TABLE_THICKNESS,
@@ -47,6 +49,7 @@ describe('3D compliant impact model', () => {
     expect(DEFAULT_PARAMS.contactPhase).toBe(55)
     expect(DEFAULT_PARAMS.racketSpeed * 3.6).toBeCloseTo(80, 12)
     expect(DEFAULT_PARAMS.racketAcceleration).toBe(0)
+    expect(DEFAULT_PARAMS.afterContactDeceleration).toBe(0)
     expect(DEFAULT_PARAMS.racketPath).toBe('linear')
     expect(DEFAULT_PARAMS.racketPathRadius).toBeCloseTo(0.7, 12)
     expect(DEFAULT_PARAMS.circleSideTilt).toBe(0)
@@ -57,9 +60,27 @@ describe('3D compliant impact model', () => {
     expect(DEFAULT_PARAMS.pathElevation).toBe(60)
     expect(DEFAULT_PARAMS.facePathAngle).toBe(0)
     expect(DEFAULT_PARAMS.faceTilt).toBe(-80)
+    expect(DEFAULT_PARAMS.topsheetTension).toBe(1)
+    expect(DEFAULT_PARAMS.boosterLevel).toBe(0)
     const minimumX = BALL_RADIUS
     const maximumX = TABLE_LENGTH / 2 - BALL_RADIUS
     expect((maximumX - DEFAULT_BALL_START.x) / (maximumX - minimumX) * 100).toBeCloseTo(80, 12)
+  })
+
+  test('uses practical material control limits around the neutral defaults', () => {
+    for (const key of Object.keys(MATERIAL_LIMITS) as Array<keyof typeof MATERIAL_LIMITS>) {
+      const limits = MATERIAL_LIMITS[key]
+      const value = DEFAULT_PARAMS[key]
+      expect(typeof value).toBe('number')
+      expect(value as number).toBeGreaterThanOrEqual(limits.min)
+      expect(value as number).toBeLessThanOrEqual(limits.max)
+    }
+    expect(MATERIAL_LIMITS.topsheetDamping).toEqual({ min: 0.05, max: 0.35, step: 0.01 })
+    expect(MATERIAL_LIMITS.topsheetTension).toEqual({ min: 0, max: 6, step: 0.1 })
+    expect(MATERIAL_LIMITS.spongeDamping).toEqual({ min: 0.1, max: 0.45, step: 0.01 })
+    expect(MATERIAL_LIMITS.bladeStiffness).toEqual({ min: 1, max: 6, step: 0.1 })
+    expect(MATERIAL_LIMITS.racketMass).toEqual({ min: 130, max: 210, step: 1 })
+    expect(MATERIAL_LIMITS.bladeDamping).toEqual({ min: 0.005, max: 0.1, step: 0.005 })
   })
 
   test('keeps the calculated contact point on the racket face for angled setups', () => {
@@ -210,18 +231,140 @@ describe('3D compliant impact model', () => {
     expect(thick.impact.totalSpinRpm).toBeGreaterThan(thin.impact.totalSpinRpm)
   })
 
-  test('a softer blade lengthens dwell and reduces peak force', () => {
-    const soft = simulate({ ...DEFAULT_PARAMS, bladeStiffness: 25 })
-    const hard = simulate({ ...DEFAULT_PARAMS, bladeStiffness: 100 })
-    expect(soft.impact.contactTime).toBeGreaterThan(hard.impact.contactTime)
-    expect(soft.impact.peakNormalForce).toBeLessThan(hard.impact.peakNormalForce)
+  test('a softer blade deflects further and returns less ball speed', () => {
+    const soft = simulate({ ...DEFAULT_PARAMS, bladeStiffness: MATERIAL_LIMITS.bladeStiffness.min })
+    const hard = simulate({ ...DEFAULT_PARAMS, bladeStiffness: MATERIAL_LIMITS.bladeStiffness.max })
+    expect(soft.impact.bladeDeflection).toBeGreaterThan(hard.impact.bladeDeflection)
+    expect(soft.impact.outgoingSpeed).toBeLessThan(hard.impact.outgoingSpeed)
   })
 
-  test('racket acceleration changes the velocity delivered during contact', () => {
-    const decelerating = simulate({ ...DEFAULT_PARAMS, racketAcceleration: -100 })
-    const accelerating = simulate({ ...DEFAULT_PARAMS, racketAcceleration: 100 })
+  test('derives the loaded blade mode from flexural rigidity and assembled mass', () => {
+    const flexible = simulate({ ...DEFAULT_PARAMS, bladeStiffness: 1 })
+    const stiff = simulate({ ...DEFAULT_PARAMS, bladeStiffness: 6 })
+    const light = simulate({ ...DEFAULT_PARAMS, racketMass: 130 })
+    const heavy = simulate({ ...DEFAULT_PARAMS, racketMass: 210 })
+    expect(stiff.impact.bladeNaturalFrequency).toBeGreaterThan(flexible.impact.bladeNaturalFrequency)
+    expect(stiff.impact.bladeDeflection).toBeLessThan(flexible.impact.bladeDeflection)
+    expect(light.impact.bladeNaturalFrequency).toBeGreaterThan(heavy.impact.bladeNaturalFrequency)
+  })
+
+  test('modal blade damping dissipates vibration energy and limits deflection', () => {
+    const lively = simulate({ ...DEFAULT_PARAMS, bladeDamping: MATERIAL_LIMITS.bladeDamping.min })
+    const damped = simulate({ ...DEFAULT_PARAMS, bladeDamping: MATERIAL_LIMITS.bladeDamping.max })
+    expect(damped.impact.bladeDissipatedEnergy).toBeGreaterThan(lively.impact.bladeDissipatedEnergy)
+    expect(damped.impact.bladeDeflection).toBeLessThan(lively.impact.bladeDeflection)
+  })
+
+  test('sponge hardness changes deformation and contact rate without acting as a loss control', () => {
+    const soft = simulate({ ...DEFAULT_PARAMS, spongeHardness: 25 })
+    const hard = simulate({ ...DEFAULT_PARAMS, spongeHardness: 60 })
+    expect(hard.impact.contactTime).toBeLessThan(soft.impact.contactTime)
+    expect(hard.impact.spongeCompression).toBeLessThan(soft.impact.spongeCompression)
+    expect(hard.impact.effectiveRestitution).toBeGreaterThan(soft.impact.effectiveRestitution)
+    expect(hard.impact.outgoingSpeed).toBeGreaterThan(soft.impact.outgoingSpeed)
+    expect(hard.impact.peakNormalForce).not.toBeCloseTo(soft.impact.peakNormalForce, 1)
+  })
+
+  test('sponge loss visibly dissipates rebound and spin energy', () => {
+    const lively = simulate({ ...DEFAULT_PARAMS, spongeDamping: MATERIAL_LIMITS.spongeDamping.min })
+    const lossy = simulate({ ...DEFAULT_PARAMS, spongeDamping: MATERIAL_LIMITS.spongeDamping.max })
+    expect(lossy.impact.effectiveRestitution).toBeLessThan(lively.impact.effectiveRestitution)
+    expect(lossy.impact.outgoingSpeed).toBeLessThan(lively.impact.outgoingSpeed)
+    expect(lossy.impact.totalSpinRpm).toBeLessThan(lively.impact.totalSpinRpm)
+  })
+
+  test('topsheet loss lowers rebound without prescribing whole-racket restitution', () => {
+    const lively = simulate({ ...DEFAULT_PARAMS, topsheetDamping: MATERIAL_LIMITS.topsheetDamping.min })
+    const lossy = simulate({ ...DEFAULT_PARAMS, topsheetDamping: MATERIAL_LIMITS.topsheetDamping.max })
+    expect(lossy.impact.effectiveRestitution).toBeLessThan(lively.impact.effectiveRestitution)
+    expect(lossy.impact.outgoingSpeed).toBeLessThan(lively.impact.outgoingSpeed)
+  })
+
+  test('topsheet pre-tension stiffens indentation and changes tangential shear', () => {
+    const setup = { ...NEUTRAL_PARAMS, pathElevation: 35, rubberGrip: 1.3 }
+    const loose = simulate({ ...setup, topsheetTension: 0 })
+    const tensioned = simulate({ ...setup, topsheetTension: MATERIAL_LIMITS.topsheetTension.max })
+    expect(tensioned.impact.contactTime).toBeLessThan(loose.impact.contactTime)
+    expect(tensioned.impact.spongeCompression).toBeLessThan(loose.impact.spongeCompression)
+    expect(tensioned.impact.effectiveRestitution).toBeGreaterThan(loose.impact.effectiveRestitution)
+    expect(tensioned.impact.outgoingSpeed).toBeGreaterThan(loose.impact.outgoingSpeed)
+    expect(Math.abs(tensioned.impact.totalSpinRpm - loose.impact.totalSpinRpm)).toBeGreaterThan(5)
+  })
+
+  test('booster expands and softens the sponge while tensioning the topsheet', () => {
+    const untreated = simulate({ ...NEUTRAL_PARAMS, boosterLevel: 0 })
+    const boosted = simulate({ ...NEUTRAL_PARAMS, boosterLevel: 100 })
+    expect(boosted.impact.effectiveSpongeThickness).toBeGreaterThan(untreated.impact.effectiveSpongeThickness)
+    expect(boosted.impact.effectiveSpongeHardness).toBeLessThan(untreated.impact.effectiveSpongeHardness)
+    expect(boosted.impact.effectiveTopsheetTension).toBeGreaterThan(untreated.impact.effectiveTopsheetTension)
+    expect(boosted.impact.effectiveRestitution).toBeGreaterThan(untreated.impact.effectiveRestitution)
+    expect(boosted.impact.outgoingSpeed).toBeGreaterThan(untreated.impact.outgoingSpeed)
+  })
+
+  test('viscoelastic restitution falls as normal impact speed rises', () => {
+    const setup = {
+      ...DEFAULT_PARAMS,
+      ballElevation: 0,
+      racketSpeed: 0,
+      pathElevation: 0,
+      faceTilt: 0,
+      spinZ: 0,
+      contactPhase: 0,
+    }
+    const slow = simulate({ ...setup, ballSpeed: 2 })
+    const fast = simulate({ ...setup, ballSpeed: 15 })
+    expect(fast.impact.effectiveRestitution).toBeLessThan(slow.impact.effectiveRestitution)
+  })
+
+  test('normal rebound follows the experimental speed and flexural-rigidity calibration', () => {
+    const setup = {
+      ...DEFAULT_PARAMS,
+      ballElevation: 0,
+      racketSpeed: 0,
+      pathElevation: 0,
+      faceTilt: 0,
+      spinZ: 0,
+      contactPhase: 0,
+    }
+    const speeds = [2, 5, 10, 20, 30]
+    const restitution = speeds.map((ballSpeed) => (
+      simulate({ ...setup, ballSpeed }).impact.effectiveRestitution
+    ))
+    for (let index = 0; index < speeds.length; index += 1) {
+      expect(restitution[index]).toBeCloseTo(
+        referenceRacketRestitution(speeds[index], DEFAULT_PARAMS.bladeStiffness),
+        1,
+      )
+      if (index > 0) expect(restitution[index]).toBeLessThan(restitution[index - 1])
+    }
+    expect(referenceRacketRestitution(10, 6)).toBeGreaterThan(
+      referenceRacketRestitution(10, 1),
+    )
+  })
+
+  test('rubber-covered default contact has millisecond-scale dwell', () => {
+    const dwellMilliseconds = simulate(DEFAULT_PARAMS).impact.contactTime * 1000
+    expect(dwellMilliseconds).toBeGreaterThan(1)
+    expect(dwellMilliseconds).toBeLessThan(1.8)
+  })
+
+  test('pre-contact acceleration changes circular speed at a timed contact point', () => {
+    const setup = {
+      ...DEFAULT_PARAMS,
+      racketPath: 'circular' as const,
+      circleContactTime: 0.05,
+    }
+    const decelerating = simulate({ ...setup, racketAcceleration: -100 })
+    const accelerating = simulate({ ...setup, racketAcceleration: 100 })
     expect(accelerating.impact.outgoingSpeed).toBeGreaterThan(decelerating.impact.outgoingSpeed)
     expect(accelerating.impact.normalForce).toBeGreaterThan(decelerating.impact.normalForce)
+  })
+
+  test('after-contact deceleration slows the racket through dwell', () => {
+    const continuing = simulate({ ...DEFAULT_PARAMS, afterContactDeceleration: 0 })
+    const braking = simulate({ ...DEFAULT_PARAMS, afterContactDeceleration: 250 })
+    expect(braking.impact.outgoingSpeed).toBeLessThan(continuing.impact.outgoingSpeed)
+    expect(braking.impact.normalForce).toBeLessThan(continuing.impact.normalForce)
   })
 
   test('circular racket radius changes the contact tangent during dwell', () => {
@@ -347,7 +490,34 @@ describe('3D compliant impact model', () => {
       spongeHardness: 25,
     })
     expect(result.impact.bottomedOut).toBe(true)
-    expect(result.impact.spongeCompressionRatio).toBeGreaterThan(0.92)
+    expect(result.impact.spongeCompressionRatio).toBeGreaterThanOrEqual(1)
+  })
+
+  test('uses practical foam travel without flagging an ordinary contact', () => {
+    const ordinary = simulate(DEFAULT_PARAMS)
+    const hardThin = simulate({
+      ...NEUTRAL_PARAMS,
+      ballSpeed: 15,
+      racketSpeed: 20,
+      spongeThickness: 1,
+      spongeHardness: 25,
+    })
+    expect(ordinary.impact.bottomedOut).toBe(false)
+    expect(ordinary.impact.spongeCompressionRatio).toBeLessThan(1)
+    expect(hardThin.impact.bottomedOut).toBe(true)
+    expect(hardThin.impact.spongeCompressionRatio).toBeGreaterThan(ordinary.impact.spongeCompressionRatio)
+  })
+
+  test('can bottom out within the visible controls at the default face orientation', () => {
+    const result = simulate({
+      ...DEFAULT_PARAMS,
+      ballSpeed: 100 / 3.6,
+      racketSpeed: 100 / 3.6,
+      spongeThickness: MATERIAL_LIMITS.spongeThickness.min,
+      spongeHardness: MATERIAL_LIMITS.spongeHardness.min,
+    })
+    expect(result.impact.bottomedOut).toBe(true)
+    expect(result.impact.spongeCompressionRatio).toBe(1)
   })
 
   test('bounces only when the outgoing arc intersects the table bounds', () => {
@@ -379,7 +549,7 @@ describe('3D compliant impact model', () => {
       {
         ...NEUTRAL_PARAMS,
         contactPhase: 0,
-        pathElevation: 5,
+        pathElevation: 0,
         spinZ: 3000,
       },
       DEFAULT_TABLE_POSITION,
@@ -446,7 +616,9 @@ describe('3D compliant impact model', () => {
       ...DEFAULT_PARAMS,
       ballSpeed: 0.1,
       racketSpeed: 0,
-      restitution: 0.2,
+      topsheetDamping: MATERIAL_LIMITS.topsheetDamping.max,
+      spongeDamping: MATERIAL_LIMITS.spongeDamping.max,
+      bladeDamping: MATERIAL_LIMITS.bladeDamping.max,
       contactPhase: 0,
     }
     const result = simulate(params)
