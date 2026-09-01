@@ -1818,7 +1818,7 @@ function App() {
     <main className={`app-shell ${darkMode ? 'dark' : ''}`}>
       <div className="workspace">
         <div className="workspace-brand">
-          <div className="brand-mark"><BouncingBallIcon size={18} /></div>
+          <div className="brand-mark"><BouncingBallIcon size={28} /></div>
           <div className="brand-copy">
             <strong>Arc Lab</strong>
             <span>Table tennis collision simulator</span>
@@ -1975,7 +1975,7 @@ function App() {
         <section className="stage-panel">
           <div className="stage-toolbar">
             <div className="toolbar-brand">
-              <div className="brand-mark"><BouncingBallIcon size={14} /></div>
+              <div className="brand-mark"><BouncingBallIcon size={20} /></div>
               <strong>Arc Lab</strong>
             </div>
             <div className="phase-indicator"><span>{phase}</span><i>{time.toFixed(3)} s</i></div>
