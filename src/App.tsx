@@ -10,7 +10,6 @@ import {
   ChevronRight,
   Circle,
   CircleDashed,
-  CircleGauge,
   Eye,
   Gauge,
   Info,
@@ -1368,16 +1367,14 @@ function SpinWidget({
   spin,
   velocity,
   darkMode,
-  time,
-  startTime,
   cameraPov,
+  playbackRate,
 }: {
   spin: Vec3
   velocity: Vec3
   darkMode: boolean
-  time: number
-  startTime: number
   cameraPov: CameraPov
+  playbackRate: number
 }) {
   const spinLength = magnitude(spin)
   const travelSpeed = magnitude(velocity)
@@ -1394,13 +1391,12 @@ function SpinWidget({
     [spinAxis],
   )
   const localPoleAxis = useMemo(() => new THREE.Vector3(0, 0, 1), [])
-  const rotationQuaternion = useMemo(
-    () => new THREE.Quaternion().setFromAxisAngle(
-      localPoleAxis,
-      spinLength * Math.max(0, time - startTime),
-    ),
-    [localPoleAxis, spinLength, startTime, time],
-  )
+  const rotationGroupRef = useRef<THREE.Group>(null)
+  const rotationAngleRef = useRef(0)
+  useFrame((_state, delta) => {
+    rotationAngleRef.current += spinLength * delta * playbackRate
+    rotationGroupRef.current?.quaternion.setFromAxisAngle(localPoleAxis, rotationAngleRef.current)
+  })
   const arrow = useMemo(
     () => new THREE.ArrowHelper(direction, new THREE.Vector3(0, 0, 0), 1.12, '#e79b51', 0.22, 0.11),
     [direction],
@@ -1420,7 +1416,7 @@ function SpinWidget({
       <ambientLight intensity={2.2} />
       <directionalLight position={[3, 4, 5]} intensity={2} />
       <group quaternion={poleQuaternion}>
-        <group quaternion={rotationQuaternion}>
+        <group ref={rotationGroupRef}>
           <mesh rotation={[Math.PI / 2, 0, 0]}>
             <sphereGeometry args={[0.62, 40, 40]} />
             <meshStandardMaterial map={seamTexture} color="#ffffff" roughness={0.66} />
@@ -1443,7 +1439,7 @@ function SpinWidget({
   )
 }
 
-function Ball({ time, result, darkMode }: { time: number; result: SimResult; darkMode: boolean }) {
+function Ball({ time, result, darkMode, playbackRate }: { time: number; result: SimResult; darkMode: boolean; playbackRate: number }) {
   const point = time < 0
     ? sampleTrajectory(result.incoming, time)
     : sampleTrajectory(result.outgoing, time)
@@ -1454,19 +1450,19 @@ function Ball({ time, result, darkMode }: { time: number; result: SimResult; dar
     const spinAxis = new THREE.Vector3(spin.x, spin.y, spin.z).normalize()
     return new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), spinAxis)
   }, [spin, spinMagnitude, time])
-  const rotationQuaternion = useMemo(
-    () => new THREE.Quaternion().setFromAxisAngle(
-      new THREE.Vector3(0, 0, 1),
-      spinMagnitude * (time < 0 ? time - result.startTime : time),
-    ),
-    [spinMagnitude, time, result.startTime],
-  )
+  const rotationAxis = useMemo(() => new THREE.Vector3(0, 0, 1), [])
+  const rotationGroupRef = useRef<THREE.Group>(null)
+  const rotationAngleRef = useRef(0)
+  useFrame((_state, delta) => {
+    rotationAngleRef.current += spinMagnitude * delta * playbackRate
+    rotationGroupRef.current?.quaternion.setFromAxisAngle(rotationAxis, rotationAngleRef.current)
+  })
   const spinAxisExtent = BALL_RADIUS * 1.75
   const seamTexture = useBallSeamTexture()
 
   return (
     <group position={[point.x, point.y, point.z]} quaternion={poleQuaternion}>
-      <group quaternion={rotationQuaternion}>
+      <group ref={rotationGroupRef}>
         <mesh castShadow rotation={[Math.PI / 2, 0, 0]}>
           <sphereGeometry args={[BALL_RADIUS, 40, 40]} />
           <meshStandardMaterial map={seamTexture} color="#ffffff" roughness={0.68} />
@@ -1489,6 +1485,7 @@ function Scene({
   result,
   params,
   time,
+  playbackRate,
   cameraPreset,
   tablePosition,
   darkMode,
@@ -1500,6 +1497,7 @@ function Scene({
   result: SimResult
   params: SimParams
   time: number
+  playbackRate: number
   cameraPreset: CameraPreset
   tablePosition: Vec3
   darkMode: boolean
@@ -1623,7 +1621,7 @@ function Scene({
       ))}
 
       <Racket time={time} result={result} params={params} handleSide={handleSide} />
-      <Ball time={time} result={result} darkMode={darkMode} />
+      <Ball time={time} result={result} darkMode={darkMode} playbackRate={playbackRate} />
 
       <OrbitControls
         ref={orbitControlsRef}
@@ -1662,6 +1660,8 @@ function App() {
   const [playing, setPlaying] = useState(false)
   const [cameraPreset, setCameraPreset] = useState<CameraPreset>('free')
   const [playbackRate, setPlaybackRate] = useState(0.25)
+  const [liveSolutionExpanded, setLiveSolutionExpanded] = useState(true)
+  const [atImpactExpanded, setAtImpactExpanded] = useState(true)
   const [ballStart, setBallStart] = useState<BallStart>(DEFAULT_BALL_START)
   const [darkMode, setDarkMode] = useState(false)
   const [speedUnit, setSpeedUnit] = useState<SpeedUnit>('km/h')
@@ -1792,6 +1792,12 @@ function App() {
   const liveRollDirection = liveRollRpm > 0 ? 'CW' : liveRollRpm < 0 ? 'CCW' : 'none'
   const liveSidespinHeader = liveSidespinRpm > 0 ? 'RIGHT SIDESPIN' : liveSidespinRpm < 0 ? 'LEFT SIDESPIN' : 'SIDESPIN'
   const liveTopBackspinHeader = liveTopBackspinRpm > 0 ? 'TOPSPIN' : liveTopBackspinRpm < 0 ? 'BACKSPIN' : 'TOP/BACKSPIN'
+  const impactSpinComponents = resolveSpinComponents(result.impact.outgoingSpin, result.impact.outgoingVelocity)
+  const impactRollRpm = impactSpinComponents.roll * 60 / (2 * Math.PI)
+  const impactTopBackspinRpm = impactSpinComponents.topBack * 60 / (2 * Math.PI)
+  const impactRollDirection = impactRollRpm > 0 ? 'CW' : impactRollRpm < 0 ? 'CCW' : 'none'
+  const impactTopBackspinLabel = impactTopBackspinRpm > 0 ? 'TOPSPIN' : impactTopBackspinRpm < 0 ? 'BACKSPIN' : 'TOP/BACKSPIN'
+  const impactSidespinHeader = result.impact.sidespinRpm > 0 ? 'RIGHT SIDESPIN' : result.impact.sidespinRpm < 0 ? 'LEFT SIDESPIN' : 'SIDESPIN'
   const speedScale = speedUnit === 'km/h' ? 3.6 : 1
   const ballLaunchDirection = vectorFromAngles(params.ballAzimuth, params.ballElevation).clone().negate()
   const launchSpinComponents = resolveSpinComponents(
@@ -1996,6 +2002,7 @@ function App() {
                 result={result}
                 params={params}
                 time={time}
+                playbackRate={playbackRate}
                 cameraPreset={cameraPreset}
                 tablePosition={tablePosition}
                 darkMode={darkMode}
@@ -2066,30 +2073,27 @@ function App() {
 
         <aside className="results-panel">
           <div className="results-heading">
-            <span className="kicker"><Activity size={11} /> LIVE SOLUTION</span>
+            <button className="results-heading-toggle" onClick={() => setLiveSolutionExpanded((value) => !value)} aria-expanded={liveSolutionExpanded}>
+              <span className="kicker"><Activity size={11} /> LIVE SOLUTION</span>
+              <ChevronDown size={14} className={`section-chevron ${liveSolutionExpanded ? '' : 'collapsed'}`} />
+            </button>
           </div>
 
-          <div className="spin-visualizer">
-            <div className="card-title">
-              <CircleGauge size={17} />
-              <span>Live travel vector</span>
-            </div>
+          {liveSolutionExpanded && (
+          <>
+          <div className="live-card">
+            <div className="card-title"><Activity size={17} /><span>Live ball</span><i>{phase} · {time.toFixed(3)} s</i></div>
             <div className="spin-canvas">
               <Canvas dpr={[1, 1.5]} camera={{ position: [0, 0, 3], fov: 43 }}>
                 <SpinWidget
                   spin={livePoint.spin}
                   velocity={livePoint.velocity}
                   darkMode={darkMode}
-                  time={time}
-                  startTime={startTime}
                   cameraPov={cameraPov}
+                  playbackRate={playbackRate}
                 />
               </Canvas>
             </div>
-          </div>
-
-          <div className="live-card">
-            <div className="card-title"><Activity size={17} /><span>Live ball</span><i>{phase} · {time.toFixed(3)} s</i></div>
             <div className="live-primary">
               <div><span>SPEED</span><strong>{(liveSpeed * speedScale).toFixed(2)}</strong><small>{speedUnit}</small></div>
               <div><span>TOTAL SPIN</span><strong>{Math.round(liveSpinRpm).toLocaleString()}</strong><small>rpm</small></div>
@@ -2110,14 +2114,30 @@ function App() {
               )}
             </div>
           </div>
+          </>
+          )}
 
-          <div className="results-subhead"><Target size={11} /> AT IMPACT</div>
+          <div className="results-subhead">
+            <button className="results-subhead-toggle" onClick={() => setAtImpactExpanded((value) => !value)} aria-expanded={atImpactExpanded}>
+              <span><Target size={11} /> AT IMPACT</span>
+              <ChevronDown size={14} className={`section-chevron ${atImpactExpanded ? '' : 'collapsed'}`} />
+            </button>
+          </div>
 
+          {atImpactExpanded && (
+          <>
           <div className="metric-grid">
             <Metric label="EXIT SPEED" value={(result.impact.outgoingSpeed * speedScale).toFixed(1)} unit={speedUnit} tone="mint" />
             <Metric label="LAUNCH" value={`${result.impact.elevation >= 0 ? '+' : ''}${result.impact.elevation.toFixed(1)}°`} unit="elevation" tone="coral" />
-            <Metric label="TOTAL SPIN" value={Math.round(result.impact.totalSpinRpm).toLocaleString()} unit="rpm" tone="violet" />
-            <Metric label="SIDESPIN" value={`${result.impact.sidespinRpm >= 0 ? '+' : ''}${Math.round(result.impact.sidespinRpm).toLocaleString()}`} unit="rpm · Y axis" tone="sand" />
+          </div>
+
+          <div className="impact-card">
+            <div className="card-title"><span>Total spin</span><i>{Math.round(result.impact.totalSpinRpm).toLocaleString()} rpm</i></div>
+            <div className="spin-readout">
+              <div><span>ROLL</span><strong>{Math.round(Math.abs(impactRollRpm)).toLocaleString()}</strong><small>rpm · {impactRollDirection}</small></div>
+              <div><span>{impactSidespinHeader}</span><strong>{Math.round(Math.abs(result.impact.sidespinRpm)).toLocaleString()}</strong><small>rpm</small></div>
+              <div><span>{impactTopBackspinLabel}</span><strong>{Math.round(Math.abs(impactTopBackspinRpm)).toLocaleString()}</strong><small>rpm</small></div>
+            </div>
           </div>
 
           <div className="exit-benchmarks">
@@ -2170,6 +2190,8 @@ function App() {
             <Info size={16} />
             <p><strong>Model note</strong> The 2.7 g ball contacts nonlinear sponge and blade springs. Tangential shear is stored during dwell and capped by Coulomb friction.</p>
           </div>
+          </>
+          )}
         </aside>
       </div>
     </main>
